@@ -1,205 +1,283 @@
 """
-Backtesting engine.
+Backtester (v5) — HONEST, look-ahead-free validation.
 
-Simulates the screener on historical data to prove (or disprove) effectiveness.
-Uses walk-forward approach:
-  1. At a past date, score all stocks using only data available then.
-  2. Pick the top N stocks.
-  3. Measure their actual forward returns.
-  4. Compare to Nifty 50 benchmark.
+Fixes the fatal flaw of the old version (which used TODAY's fundamentals in
+the past). Here the historical signal is built ONLY from price data available
+up to each point in time, so results are legitimate.
+
+What it does:
+  1. Rolling monthly rebalance into the top-N momentum leaders.
+  2. Uptrend-only + market-regime filter (go to cash when Nifty < 200-DMA).
+  3. Two-stage stop: initial hard stop + ratcheting trailing stop (ride winners).
+  4. Realistic round-trip costs on every trade.
+  5. Real metrics: CAGR, max drawdown, Sharpe, Sortino, win rate, avg win/loss,
+     profit factor, expectancy, exposure — vs a Nifty buy-and-hold benchmark.
+  6. A decile test: proves whether high-signal stocks actually beat low-signal
+     ones on forward returns (signal monotonicity). This is the real proof.
 """
 
-import pandas as pd
 import numpy as np
-from technical_analysis import technical_score, relative_strength
-from fundamental_analysis import fundamental_score
-from scoring_engine import composite
-from config import RISK_PROFILES
+import pandas as pd
+from config import RISK_PROFILES, COST_PARAMS, REGIME
+from risk_engine import equity_metrics
+
+REBAL_DAYS = 21          # ~monthly
+TRAIL_PCT = 0.15         # trailing stop distance once in profit
+MIN_HISTORY = 210        # need ~200-DMA before trading
 
 
-def _slice_to_date(df: pd.DataFrame, end_idx: int) -> pd.DataFrame:
-    """Return dataframe up to a given index position (simulating 'we only have data until here')."""
-    if df is None or end_idx <= 30:
-        return None
-    return df.iloc[:end_idx].copy()
+# ── Point-in-time momentum signal (price-only → no look-ahead) ───────────────────
 
-
-def run_backtest(
-    all_data: dict,
-    bench_df: pd.DataFrame,
-    profile: str = "Moderate",
-    lookback_days: int = 126,
-    forward_days: int = 63,
-    top_n: int = 10,
-) -> dict:
+def _signal_at(close_row_idx, closes, sma50, sma200):
     """
-    Walk-forward backtest.
-
-    Args:
-        all_data: {ticker: {"price": DataFrame, "info": dict}}
-        bench_df: Nifty 50 price DataFrame
-        profile: risk profile name
-        lookback_days: how many days back to simulate the screening point
-        forward_days: how many days forward to measure returns
-        top_n: pick top N stocks from screening
-
-    Returns:
-        dict with backtest results
+    closes/sma arrays are 1D numpy for a single stock.
+    Returns (score, eligible). Score = blended momentum; eligible = in uptrend.
     """
-    if bench_df is None or len(bench_df) < lookback_days + forward_days + 50:
-        return {"error": "Not enough benchmark data for backtest"}
+    i = close_row_idx
+    c = closes[i]
+    if np.isnan(c) or c <= 0:
+        return None, False
 
-    # The screening happens at `screen_idx` (end of lookback period)
-    screen_idx = len(bench_df) - forward_days
-    if screen_idx < 200:
-        return {"error": "Not enough data"}
+    def ret(period):
+        j = i - period
+        if j < 0 or np.isnan(closes[j]) or closes[j] <= 0:
+            return None
+        return closes[i] / closes[j] - 1
 
-    # Slice benchmark
-    bench_slice = bench_df.iloc[:screen_idx].copy()
-    bench_future = bench_df.iloc[screen_idx:screen_idx + forward_days].copy()
+    r63, r126 = ret(63), ret(126)
+    r12_1 = None
+    if i >= 252 and not np.isnan(closes[i - 21]) and not np.isnan(closes[i - 252]) and closes[i - 252] > 0:
+        r12_1 = closes[i - 21] / closes[i - 252] - 1
 
-    bench_ret = 0
-    if len(bench_future) > 0:
-        bench_ret = (bench_future["Close"].iloc[-1] / bench_future["Close"].iloc[0] - 1) * 100
+    parts, w = 0.0, 0.0
+    if r126 is not None: parts += r126 * 0.40; w += 0.40
+    if r63 is not None:  parts += r63 * 0.30; w += 0.30
+    if r12_1 is not None: parts += r12_1 * 0.30; w += 0.30
+    if w == 0:
+        return None, False
+    score = parts / w
 
-    # Score each stock at the screening point
-    scored = []
-    for ticker, data in all_data.items():
-        price = data.get("price")
-        info = data.get("info")
-        if price is None:
+    elig = True
+    if not np.isnan(sma200[i]) and sma200[i] > 0:
+        elig = elig and c > sma200[i]
+    if not np.isnan(sma50[i]) and sma50[i] > 0:
+        elig = elig and c > sma50[i]
+    return score, elig
+
+
+# ── Main backtest ────────────────────────────────────────────────────────────────
+
+def run_backtest(all_data: dict, bench_df: pd.DataFrame,
+                 profile: str = "Moderate", use_regime: bool = True) -> dict:
+    p = RISK_PROFILES.get(profile, RISK_PROFILES["Moderate"])
+    top_n = p["max_stocks"]
+    init_stop = p["core_stop_pct"]
+    cost = COST_PARAMS["round_trip_cost"]
+
+    if bench_df is None or len(bench_df) < MIN_HISTORY + REBAL_DAYS:
+        return {"error": "Not enough history. Use a 3Y or 5Y data period for a meaningful backtest."}
+
+    # Align all stocks to benchmark dates (build once via concat to avoid fragmentation)
+    dates = bench_df.index
+    close_d, high_d, low_d = {}, {}, {}
+    for t, d in all_data.items():
+        px = d.get("price")
+        if px is None or len(px) < MIN_HISTORY:
             continue
+        close_d[t] = px["Close"].reindex(dates).ffill(limit=5)
+        high_d[t] = px["High"].reindex(dates).ffill(limit=5)
+        low_d[t] = px["Low"].reindex(dates).ffill(limit=5)
+    close_m = pd.DataFrame(close_d, index=dates)
+    high_m = pd.DataFrame(high_d, index=dates)
+    low_m = pd.DataFrame(low_d, index=dates)
 
-        # Find matching index — price data index must align
-        # We need to slice the stock's price data to the same date window
-        if len(price) < lookback_days + forward_days + 50:
-            continue
+    tickers = list(close_m.columns)
+    if len(tickers) < top_n:
+        return {"error": f"Only {len(tickers)} stocks have enough history for a backtest (need ≥{top_n})."}
 
-        stock_screen_idx = len(price) - forward_days
-        if stock_screen_idx < 100:
-            continue
+    # Precompute arrays
+    closes = {t: close_m[t].to_numpy() for t in tickers}
+    highs = {t: high_m[t].to_numpy() for t in tickers}
+    lows = {t: low_m[t].to_numpy() for t in tickers}
+    sma50 = {t: close_m[t].rolling(50).mean().to_numpy() for t in tickers}
+    sma200 = {t: close_m[t].rolling(200).mean().to_numpy() for t in tickers}
 
-        stock_slice = price.iloc[:stock_screen_idx].copy()
-        stock_future = price.iloc[stock_screen_idx:stock_screen_idx + forward_days].copy()
+    bench_close = bench_df["Close"].to_numpy()
+    bench_sma200 = bench_df["Close"].rolling(REGIME["index_ma"]).mean().to_numpy()
 
-        if len(stock_slice) < 50 or len(stock_future) < 5:
-            continue
+    n = len(dates)
+    start = MIN_HISTORY
 
-        # Score using only historical data
-        tech = technical_score(stock_slice, bench_slice)
-        # Use ticker as fallback name
-        name = ticker.replace(".NS", "")
-        sector = "Unknown"
-        fund = fundamental_score(info, sector)
-        comp = composite(tech, fund, profile)
+    # Portfolio state (normalized capital = 1.0, fractional shares)
+    cash = 1.0
+    holds = {}  # ticker -> {shares, entry, peak}
+    equity_curve = []
+    trades = []          # closed-trade P&L %
+    days_in_cash = 0
+    invested_days = 0
 
-        # Actual forward return
-        actual_ret = (stock_future["Close"].iloc[-1] / stock_future["Close"].iloc[0] - 1) * 100
+    def regime_ok(i):
+        if not use_regime:
+            return True
+        if np.isnan(bench_sma200[i]):
+            return True
+        return bench_close[i] > bench_sma200[i]
 
-        scored.append({
-            "ticker": ticker,
-            "name": name,
-            "sector": sector,
-            "composite": comp,
-            "tech_score": tech["score"],
-            "fund_score": fund["score"],
-            "stage": tech.get("stage", (0, "N/A"))[1],
-            "actual_return": round(actual_ret, 2),
-        })
+    def port_value(i):
+        val = cash
+        for t, h in holds.items():
+            px = closes[t][i]
+            if not np.isnan(px):
+                val += h["shares"] * px
+        return val
 
-    if not scored:
-        return {"error": "No stocks could be scored"}
+    for i in range(start, n):
+        # 1) Update peaks & check stops (intraday low vs stop)
+        for t in list(holds.keys()):
+            h = holds[t]
+            hi = highs[t][i]
+            lo = lows[t][i]
+            c = closes[t][i]
+            if np.isnan(c):
+                continue
+            if not np.isnan(hi):
+                h["peak"] = max(h["peak"], hi)
+            stop_level = max(h["entry"] * (1 - init_stop), h["peak"] * (1 - TRAIL_PCT))
+            if not np.isnan(lo) and lo <= stop_level:
+                # exit at stop (assume stop order fills at stop_level)
+                proceeds = h["shares"] * stop_level * (1 - cost / 2)
+                cash += proceeds
+                pnl = (stop_level / h["entry"] - 1) * 100
+                trades.append(pnl)
+                del holds[t]
 
-    # Rank and pick top N
-    scored.sort(key=lambda x: x["composite"], reverse=True)
-    top_picks = scored[:top_n]
-    bottom_picks = scored[-top_n:] if len(scored) > top_n else []
+        # 2) Rebalance
+        if (i - start) % REBAL_DAYS == 0:
+            if not regime_ok(i):
+                # risk-off → go fully to cash
+                for t in list(holds.keys()):
+                    c = closes[t][i]
+                    if np.isnan(c):
+                        continue
+                    cash += holds[t]["shares"] * c * (1 - cost / 2)
+                    trades.append((c / holds[t]["entry"] - 1) * 100)
+                    del holds[t]
+            else:
+                # rank eligible stocks by signal
+                ranked = []
+                for t in tickers:
+                    sc, elig = _signal_at(i, closes[t], sma50[t], sma200[t])
+                    if sc is not None and elig:
+                        ranked.append((sc, t))
+                ranked.sort(reverse=True)
+                target = set(t for _, t in ranked[:top_n])
 
-    # Portfolio return (equal weight top picks)
-    top_returns = [s["actual_return"] for s in top_picks]
-    portfolio_return = np.mean(top_returns) if top_returns else 0
+                # sell holdings not in target
+                for t in list(holds.keys()):
+                    if t not in target:
+                        c = closes[t][i]
+                        if np.isnan(c):
+                            continue
+                        cash += holds[t]["shares"] * c * (1 - cost / 2)
+                        trades.append((c / holds[t]["entry"] - 1) * 100)
+                        del holds[t]
 
-    # Win rate
-    winners = sum(1 for r in top_returns if r > 0)
-    win_rate = (winners / len(top_returns) * 100) if top_returns else 0
+                # buy new entrants — equal weight to target size
+                buys = [t for t in target if t not in holds]
+                if buys:
+                    total_val = port_value(i)
+                    target_per = total_val / top_n
+                    for t in buys:
+                        c = closes[t][i]
+                        if np.isnan(c) or c <= 0:
+                            continue
+                        alloc = min(target_per, cash)
+                        if alloc <= 0:
+                            break
+                        shares = (alloc * (1 - cost / 2)) / c
+                        cash -= alloc
+                        holds[t] = {"shares": shares, "entry": c, "peak": c}
 
-    # Bottom picks return for comparison
-    bottom_returns = [s["actual_return"] for s in bottom_picks]
-    bottom_return = np.mean(bottom_returns) if bottom_returns else 0
+        # 3) Mark to market
+        equity_curve.append(port_value(i))
+        if holds:
+            invested_days += 1
+        else:
+            days_in_cash += 1
 
-    # Calculate max drawdown of top picks
-    max_dd = min(top_returns) if top_returns else 0
+    eq = pd.Series(equity_curve, index=dates[start:n])
+    strat = equity_metrics(eq, trades)
+    strat["exposure"] = round(invested_days / max(1, (n - start)) * 100, 1)
+    strat["days_in_cash_pct"] = round(days_in_cash / max(1, (n - start)) * 100, 1)
 
-    # Alpha
-    alpha = portfolio_return - bench_ret
+    # Benchmark buy & hold
+    bench_eq = pd.Series(bench_close[start:n] / bench_close[start], index=dates[start:n])
+    bench_m = equity_metrics(bench_eq)
 
-    # Sharpe-like ratio (simplified)
-    if top_returns and np.std(top_returns) > 0:
-        sharpe = portfolio_return / np.std(top_returns)
-    else:
-        sharpe = 0
+    # Decile validation (does signal predict forward returns?)
+    decile = _decile_validation(tickers, closes, sma50, sma200, start, n)
 
-    screen_date = bench_df.index[screen_idx].strftime("%Y-%m-%d") if hasattr(bench_df.index[screen_idx], "strftime") else str(screen_idx)
-    end_date = bench_df.index[min(screen_idx + forward_days - 1, len(bench_df) - 1)].strftime("%Y-%m-%d") if hasattr(bench_df.index[0], "strftime") else "N/A"
+    # Downsample equity curves for charting
+    def _sample(series, k=300):
+        if len(series) <= k:
+            idx = range(len(series))
+        else:
+            idx = np.linspace(0, len(series) - 1, k).astype(int)
+        return [{"date": series.index[j].strftime("%Y-%m-%d"),
+                 "value": round(float(series.iloc[j]), 4)} for j in idx]
 
+    years = (n - start) / 252
     return {
-        "screen_date": screen_date,
-        "end_date": end_date,
-        "forward_days": forward_days,
-        "top_n": top_n,
-        "portfolio_return": round(portfolio_return, 2),
-        "benchmark_return": round(bench_ret, 2),
-        "alpha": round(alpha, 2),
-        "win_rate": round(win_rate, 1),
-        "sharpe": round(sharpe, 2),
-        "max_single_loss": round(max_dd, 2),
-        "best_pick_return": round(max(top_returns), 2) if top_returns else 0,
-        "worst_pick_return": round(min(top_returns), 2) if top_returns else 0,
-        "bottom_picks_return": round(bottom_return, 2),
-        "total_scored": len(scored),
-        "top_picks": top_picks,
-        "bottom_picks": bottom_picks[:5],
+        "strategy": strat,
+        "benchmark": bench_m,
+        "n_trades": len(trades),
+        "decile": decile,
+        "equity": {"strategy": _sample(eq / eq.iloc[0]),
+                   "benchmark": _sample(bench_eq)},
+        "period": {
+            "start": dates[start].strftime("%Y-%m-%d"),
+            "end": dates[n - 1].strftime("%Y-%m-%d"),
+            "years": round(years, 1),
+        },
+        "profile": profile,
+        "alpha_cagr": round(strat.get("cagr", 0) - bench_m.get("cagr", 0), 1),
     }
 
 
-def run_multi_period_backtest(all_data, bench_df, profile="Moderate", top_n=10):
+def _decile_validation(tickers, closes, sma50, sma200, start, n, fwd=REBAL_DAYS):
     """
-    Run backtests across multiple lookback periods to prove consistency.
+    Across many past dates, bucket stocks by signal into deciles and measure
+    average forward return. If the strategy has edge, decile 10 (highest signal)
+    should beat decile 1 — ideally monotonically.
     """
-    results = []
-    periods = [
-        {"label": "3 months ago → now",   "lookback": 63,  "forward": 63},
-        {"label": "6 months ago → 3m ago", "lookback": 126, "forward": 63},
-        {"label": "6 months ago → now",    "lookback": 126, "forward": 126},
-    ]
+    rows = []
+    step = REBAL_DAYS
+    for i in range(start, n - fwd, step):
+        for t in tickers:
+            sc, _ = _signal_at(i, closes[t], sma50[t], sma200[t])
+            if sc is None:
+                continue
+            c0, c1 = closes[t][i], closes[t][i + fwd]
+            if np.isnan(c0) or np.isnan(c1) or c0 <= 0:
+                continue
+            rows.append((sc, (c1 / c0 - 1) * 100))
+    if len(rows) < 100:
+        return {"available": False}
 
-    for p in periods:
-        r = run_backtest(
-            all_data, bench_df, profile,
-            lookback_days=p["lookback"],
-            forward_days=p["forward"],
-            top_n=top_n,
-        )
-        r["label"] = p["label"]
-        results.append(r)
-
-    # Summary stats across all periods
-    valid = [r for r in results if "error" not in r]
-    if valid:
-        avg_return = np.mean([r["portfolio_return"] for r in valid])
-        avg_alpha = np.mean([r["alpha"] for r in valid])
-        avg_win = np.mean([r["win_rate"] for r in valid])
-        consistency = sum(1 for r in valid if r["portfolio_return"] > r["benchmark_return"]) / len(valid) * 100
-    else:
-        avg_return = avg_alpha = avg_win = consistency = 0
-
+    df = pd.DataFrame(rows, columns=["signal", "fwd"])
+    df["decile"] = pd.qcut(df["signal"], 10, labels=False, duplicates="drop")
+    grp = df.groupby("decile")["fwd"].mean()
+    deciles = [round(float(v), 2) for v in grp.values]
+    top, bottom = deciles[-1], deciles[0]
+    # monotonic-ish check: top decile beats bottom and top-3 avg beats bottom-3 avg
+    mono = (np.mean(deciles[-3:]) > np.mean(deciles[:3])) and (top > bottom)
     return {
-        "periods": results,
-        "summary": {
-            "avg_return": round(avg_return, 2),
-            "avg_alpha": round(avg_alpha, 2),
-            "avg_win_rate": round(avg_win, 1),
-            "beat_benchmark_pct": round(consistency, 0),
-            "periods_tested": len(valid),
-        },
+        "available": True,
+        "deciles": deciles,
+        "top_decile_fwd": round(top, 2),
+        "bottom_decile_fwd": round(bottom, 2),
+        "spread": round(top - bottom, 2),
+        "monotonic": bool(mono),
+        "sample": len(df),
+        "fwd_days": fwd,
     }

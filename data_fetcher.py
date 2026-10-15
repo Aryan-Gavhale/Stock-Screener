@@ -24,6 +24,7 @@ COOKIE_URL = "https://fc.yahoo.com"
 
 PERIOD_MAP = {
     "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365, "2y": 730,
+    "3y": 1095, "5y": 1825, "10y": 3650,
 }
 
 # ── Session & Crumb management ────────────────────────────────────────────────
@@ -108,6 +109,46 @@ def fetch_price(ticker: str, period: str = "2y") -> pd.DataFrame | None:
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_nifty(period: str = "2y") -> pd.DataFrame | None:
     return fetch_price(NIFTY_TICKER, period)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_market_context() -> dict:
+    """
+    Cross-asset context for the Crash Radar: India VIX, S&P 500, US VIX,
+    USD/INR, crude. Each may be None if Yahoo doesn't return it — the radar
+    degrades gracefully to whatever is available.
+    """
+    from config import MARKET_CONTEXT
+    out = {}
+    for name, sym in MARKET_CONTEXT.items():
+        try:
+            out[name] = fetch_price(sym, "2y")
+        except Exception:
+            out[name] = None
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_sector_indices(period: str = "10y") -> dict:
+    """Fetch all configured official Nifty sector price indices in parallel."""
+    from config import SECTOR_INDICES
+
+    out = {}
+    workers = min(6, len(SECTOR_INDICES))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(fetch_price, symbol, period): (sector, symbol)
+            for sector, symbol in SECTOR_INDICES.items()
+        }
+        for future in as_completed(futures):
+            sector, symbol = futures[future]
+            try:
+                price = future.result()
+            except Exception:
+                price = None
+            if price is not None:
+                out[sector] = {"price": price, "symbol": symbol, "source": "Official"}
+    return out
 
 # ── Fundamentals ───────────────────────────────────────────────────────────────
 
@@ -225,6 +266,80 @@ def fetch_news(query: str = "indian stock market NSE") -> list:
     except Exception:
         return []
 
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_risk_news() -> dict:
+    """
+    Scan headlines for crash-related keywords and return a 0-100 news-risk
+    score plus the matched terms. Low-confidence signal by nature — weighted
+    lightly in the Crash Radar.
+    """
+    from config import CRASH_NEWS_KEYWORDS
+    q = ("India stock market crash OR selloff OR correction OR RBI rate OR Fed OR "
+         "inflation OR recession OR geopolitical OR FII selling")
+    headlines = fetch_news(q)
+    hi = CRASH_NEWS_KEYWORDS["high"]
+    md = CRASH_NEWS_KEYWORDS["med"]
+    score, matched = 0, []
+    for a in headlines:
+        title = (a.get("title") or "").lower()
+        for k in hi:
+            if k in title:
+                score += 12; matched.append(k)
+        for k in md:
+            if k in title:
+                score += 5; matched.append(k)
+    return {"score": min(100, score), "matched": sorted(set(matched)), "headlines": headlines}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_sector_news(sector: str) -> dict:
+    """Small, transparent catalyst score for a sector's current headlines."""
+    from config import SECTOR_NEWS_TERMS
+
+    query_name = {
+        "Banking & Finance": "Indian banks financial stocks",
+        "Fertilizers & Agrochemicals": "India fertilizer agrochemical stocks monsoon subsidy",
+        "Oil & Gas": "India oil gas energy stocks crude",
+        "Real Estate": "India real estate stocks interest rates",
+    }.get(sector, f"India {sector} sector stocks")
+    headlines = fetch_news(query_name)
+    score = 50
+    positive, negative = [], []
+    for article in headlines:
+        title = (article.get("title") or "").lower()
+        for term in SECTOR_NEWS_TERMS["positive"]:
+            if term in title:
+                score += 6
+                positive.append(term)
+        for term in SECTOR_NEWS_TERMS["negative"]:
+            if term in title:
+                score -= 7
+                negative.append(term)
+    return {
+        "score": max(0, min(100, score)),
+        "positive": sorted(set(positive)),
+        "negative": sorted(set(negative)),
+        "headlines": headlines,
+        "fetched_at": datetime.now().isoformat(timespec="minutes"),
+    }
+
+
+def fetch_all_sector_news(sectors: list[str]) -> dict:
+    """Fetch sector catalyst scans concurrently."""
+    out = {}
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(sectors)))) as pool:
+        futures = {pool.submit(fetch_sector_news, sector): sector
+                   for sector in sectors}
+        for future in as_completed(futures):
+            sector = futures[future]
+            try:
+                out[sector] = future.result()
+            except Exception:
+                out[sector] = {"score": 50, "positive": [], "negative": [],
+                               "headlines": [], "fetched_at": None}
+    return out
+
 # ── Market breadth ─────────────────────────────────────────────────────────────
 
 def market_breadth(all_data: dict) -> dict:
@@ -240,3 +355,26 @@ def market_breadth(all_data: dict) -> dict:
     pct = (above / total * 100) if total else 50
     label = "Bullish" if pct >= 65 else ("Neutral" if pct >= 45 else "Bearish")
     return {"above_50sma_pct": round(pct, 1), "label": label, "above": above, "total": total}
+
+
+def breadth_series(all_data: dict, lookback: int = 300) -> pd.Series | None:
+    """
+    Time series of % of stocks above their 50-DMA. Used by the Crash Radar to
+    detect breadth deterioration / index-up-breadth-down divergence and by the
+    Dip detector to spot a breadth washout + turn.
+    """
+    closes = {}
+    for t, d in (all_data or {}).items():
+        px = d.get("price")
+        if px is None or len(px) < 60:
+            continue
+        closes[t] = px["Close"]
+    if len(closes) < 10:
+        return None
+    cm = pd.DataFrame(closes)
+    sma = cm.rolling(50).mean()
+    above = (cm > sma)
+    valid = cm.notna()
+    pct = (above & valid).sum(axis=1) / valid.sum(axis=1).replace(0, np.nan) * 100
+    pct = pct.dropna()
+    return pct.tail(lookback) if len(pct) > 0 else None
